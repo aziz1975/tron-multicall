@@ -1,0 +1,8 @@
+{
+  "dependencies": {
+    "dotenv": "^17.2.1",
+    "ethers": "^6.15.0",
+    "tronweb": "^6.0.4",
+    "web3": "^4.16.0"
+  }
+}
