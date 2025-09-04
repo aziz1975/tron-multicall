@@ -22,13 +22,23 @@ const tronWeb = new TronWeb({
 
 // ───────── selectors (Web3) ─────────
 const SELECTORS = {
+  // ERC-20 metadata
   name:        web3.eth.abi.encodeFunctionSignature({ name:'name',        type:'function', inputs:[] }),
   symbol:      web3.eth.abi.encodeFunctionSignature({ name:'symbol',      type:'function', inputs:[] }),
   decimals:    web3.eth.abi.encodeFunctionSignature({ name:'decimals',    type:'function', inputs:[] }),
   totalSupply: web3.eth.abi.encodeFunctionSignature({ name:'totalSupply', type:'function', inputs:[] }),
 };
 
-// ───────── Multicall3 ABIs (override to view so .call() works) ─────────
+const CHAIN_SELECTORS = {
+  getChainId:               web3.eth.abi.encodeFunctionSignature({ name:'getChainId',               type:'function', inputs:[] }),
+  getBlockNumber:           web3.eth.abi.encodeFunctionSignature({ name:'getBlockNumber',           type:'function', inputs:[] }),
+  getCurrentBlockTimestamp: web3.eth.abi.encodeFunctionSignature({ name:'getCurrentBlockTimestamp', type:'function', inputs:[] }),
+  // We can add more here if needed:
+  // getLastBlockHash:         web3.eth.abi.encodeFunctionSignature({ name:'getLastBlockHash', type:'function', inputs:[] }),
+  // getBasefee:               web3.eth.abi.encodeFunctionSignature({ name:'getBasefee',       type:'function', inputs:[] }),
+};
+
+// ───────── Multicall3 ABIs (override to "view" so .call() works) ─────────
 const ABI_TRY_AGG = [{
   name: 'tryAggregate',
   type: 'function',
@@ -69,6 +79,13 @@ const ABI_AGG3 = [{
   }]
 }];
 
+// Direct-call ABI for Multicall3 helper getters (optional fallback)
+const ABI_CHAIN_HELPERS = [
+  { name:'getChainId',               type:'function', stateMutability:'view', inputs:[], outputs:[{type:'uint256', name:'chainid'}] },
+  { name:'getBlockNumber',           type:'function', stateMutability:'view', inputs:[], outputs:[{type:'uint256', name:'blockNumber'}] },
+  { name:'getCurrentBlockTimestamp', type:'function', stateMutability:'view', inputs:[], outputs:[{type:'uint256', name:'timestamp'}] },
+];
+
 // ───────── decoders for inner bytes ─────────
 function decodeString(hex) {
   try { const s = web3.eth.abi.decodeParameter('string', hex); if (s) return s; } catch {}
@@ -79,6 +96,7 @@ function decodeString(hex) {
   } catch {}
   return '';
 }
+
 function decodeUint(hex, type = 'uint256') {
   try { return web3.eth.abi.decodeParameter(type, hex).toString(); }
   catch { return web3.eth.abi.decodeParameter('uint256', hex).toString(); }
@@ -106,7 +124,7 @@ function normalizeResult(result) {
   });
 }
 
-// ───────── call helpers ─────────
+// ───────── call helpers: ERC-20 metadata via tryAggregate / aggregate3 ─────────
 async function callTryAggregate(tokens) {
   const methods = ['name','symbol','decimals','totalSupply'];
   const calls = [];
@@ -129,6 +147,43 @@ async function callAggregate3(tokens) {
   const mc = await tronWeb.contract(ABI_AGG3, MULTICALL3_T_ADDR);
   const raw = await mc.aggregate3(calls).call({ from: CALLER_T_ADDR });
   return normalizeResult(raw);
+}
+
+// ───────── NEW: chain info via Multicall3 ─────────
+// Preferred: batch these three getters through tryAggregate (target = Multicall3)
+async function fetchChainInfoViaTryAggregate() {
+  const calls = [
+    [ MULTICALL3_T_ADDR, CHAIN_SELECTORS.getChainId ],
+    [ MULTICALL3_T_ADDR, CHAIN_SELECTORS.getBlockNumber ],
+    [ MULTICALL3_T_ADDR, CHAIN_SELECTORS.getCurrentBlockTimestamp ],
+  ];
+  const mc = await tronWeb.contract(ABI_TRY_AGG, MULTICALL3_T_ADDR);
+  const raw = await mc.tryAggregate(false, calls).call({ from: CALLER_T_ADDR });
+  const arr = normalizeResult(raw);
+  if (arr.length !== 3) throw new Error(`Unexpected chain-info results length: got ${arr.length}, expected 3`);
+
+  const chainId   = arr[0].success ? Number(decodeUint(arr[0].returnData)) : null;
+  const blockNum  = arr[1].success ? Number(decodeUint(arr[1].returnData)) : null;
+  const timestamp = arr[2].success ? Number(decodeUint(arr[2].returnData)) : null;
+
+  return { chainId, blockNumber: blockNum, timestamp, via: 'tryAggregate' };
+}
+
+// Fallback: direct .call() on Multicall3 getters
+async function fetchChainInfoDirect() {
+  const mc = await tronWeb.contract(ABI_CHAIN_HELPERS, MULTICALL3_T_ADDR);
+  const [chainId, blockNumber, timestamp] = await Promise.all([
+    mc.getChainId().call({ from: CALLER_T_ADDR }),
+    mc.getBlockNumber().call({ from: CALLER_T_ADDR }),
+    mc.getCurrentBlockTimestamp().call({ from: CALLER_T_ADDR }),
+  ]);
+  // TronWeb generally returns strings for uints; make them numbers (safe ranges here)
+  return {
+    chainId: Number(chainId),
+    blockNumber: Number(blockNumber),
+    timestamp: Number(timestamp),
+    via: 'direct',
+  };
 }
 
 // ───────── public API ─────────
@@ -158,20 +213,33 @@ async function fetchMetadataBatch(tokens) {
     const decimals    = rDec .success ? Number(decodeUint(rDec .returnData, 'uint8')) : null;
     const totalSupply = rSup .success ? decodeUint(rSup .returnData, 'uint256')       : null;
 
-    out.push({ token: tokens[i], success: rName.success && rSym.success && rDec.success && rSup.success,
-               name, symbol, decimals, totalSupply });
+    out.push({
+      token: tokens[i],
+      success: rName.success && rSym.success && rDec.success && rSup.success,
+      name, symbol, decimals, totalSupply
+    });
   }
   return out;
 }
 
 // ───────── runner ─────────
 (async () => {
+  // Example tokens
   const TOKENS = [
     'TNo59Khpq46FGf4sD7XSWYFNfYfbc8CqNK',
     'TDyvndWuvX5xTBwHPYJi7J3Yq8pq8yh62h',
-
   ];
 
+  // 1) Chain info via aggregated call (with direct-call fallback)
+  let chainInfo;
+  try {
+    chainInfo = await fetchChainInfoViaTryAggregate();
+  } catch (e) {
+    chainInfo = await fetchChainInfoDirect();
+  }
+  console.log('Chain Info:', chainInfo);
+
+  // 2) ERC-20 metadata in chunks
   const CHUNK = 50;
   const results = [];
   for (let i = 0; i < TOKENS.length; i += CHUNK) {
@@ -183,7 +251,6 @@ async function fetchMetadataBatch(tokens) {
 
   console.table(results);
 })().catch(e => {
-  // console.dir(e, { depth: 5 });
   console.error(e);
   process.exit(1);
 });
